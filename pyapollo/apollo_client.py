@@ -9,6 +9,10 @@ import logging
 import os
 import threading
 import time
+import base64
+import hmac
+from hashlib import sha1
+from urllib.parse import quote
 
 import requests
 
@@ -22,7 +26,7 @@ class ApolloClient(object):
     """
 
     def __init__(self, app_id, cluster='default', config_server_url='http://localhost:8080', timeout=60, ip=None,
-                 cycle_time=300, cache_file_path=None):
+                 cycle_time=300, cache_file_path=None, secret=None):
         """
 
         :param app_id:
@@ -32,11 +36,13 @@ class ApolloClient(object):
         :param ip: the deploy ip for grey release
         :param cycle_time: the cycle time to update configuration content from server
         :param cache_file_path: local cache file store path
+        "param secret: after Apollo 1.6.0, if config secret, should use secret
         """
         self.config_server_url = config_server_url
         self.app_id = app_id
         self.cluster = cluster
         self.timeout = timeout
+        self.secret = secret
         self.stopped = False
         self.ip = self.init_ip(ip)
 
@@ -67,6 +73,27 @@ class ApolloClient(object):
             finally:
                 s.close()
         return ip
+
+    @staticmethod
+    def hash_hmac(data, key, sha1):
+        '''
+        encrypt by HMACSHA1
+        :param data: encrypt data;
+        :param key: encrypt key;
+        :param sha
+        '''
+        hmac_code = hmac.new(key.encode(), data.encode(), sha1).digest()
+        return base64.b64encode(hmac_code).decode()
+
+    def get_headers(self, base_url):
+        timestamp = str(int(time.time()*1000))
+        authorization = self.hash_hmac('{}\n{}'.format(timestamp, base_url), self.secret, sha1)
+        headers = {
+            'Authorization': 'Apollo {}:{}'.format(self.app_id, authorization),
+            'Timestamp': timestamp
+        }
+
+        return headers
 
     def get_value(self, key, default_val=None, namespace='application', auto_fetch_on_cache_miss=False):
         """
@@ -139,11 +166,16 @@ class ApolloClient(object):
         :param namespace:
         :return:
         """
-        url = '{}/configfiles/json/{}/{}/{}?ip={}'.format(self.config_server_url, self.app_id, self.cluster, namespace,
-                                                          self.ip)
+        base_url = '/configfiles/json/{}/{}/{}?ip={}'.format(
+            self.app_id, self.cluster, namespace, self.ip
+        )
+
         data = {}
         try:
-            r = requests.get(url)
+            r = requests.get(
+                '{}{}'.format(self.config_server_url, base_url), 
+                headers = self.get_headers(base_url) if self.secret else None
+            )
             if r.ok:
                 data = r.json()
                 self._cache[namespace] = data
@@ -170,9 +202,13 @@ class ApolloClient(object):
         :param namespace:
         :return:
         """
-        url = '{}/configs/{}/{}/{}?ip={}'.format(self.config_server_url, self.app_id, self.cluster, namespace, self.ip)
+        base_url = '/configs/{}/{}/{}?ip={}'.format(self.app_id, self.cluster, namespace, self.ip)
+
         try:
-            r = requests.get(url)
+            r = requests.get(
+                '{}{}'.format(self.config_server_url, base_url),
+                headers = self.get_headers(base_url) if self.secret else None
+            )
             if r.status_code == 200:
                 data = r.json()
                 self._cache[namespace] = data['configurations']
@@ -234,7 +270,6 @@ class ApolloClient(object):
         return {}
 
     def _long_poll(self):
-        url = '{}/notifications/v2'.format(self.config_server_url)
         notifications = []
         for key in self._notification_map:
             notification_id = self._notification_map[key]
@@ -242,12 +277,16 @@ class ApolloClient(object):
                 'namespaceName': key,
                 'notificationId': notification_id
             })
+
+        base_url = '/notifications/v2?appId={}&cluster={}&notifications={}'.format(
+            self.app_id, self.cluster, quote(json.dumps(notifications, ensure_ascii=False), 'utf-8')
+        )
+        
         try:
-            r = requests.get(url=url, params={
-                'appId': self.app_id,
-                'cluster': self.cluster,
-                'notifications': json.dumps(notifications, ensure_ascii=False)
-            }, timeout=self.timeout)
+            r = requests.get(url='{}{}'.format(self.config_server_url, base_url), 
+                timeout=self.timeout,
+                headers = self.get_headers(base_url) if self.secret else None
+            )
 
             logging.getLogger(__name__).debug('Long polling returns %d: url=%s', r.status_code, r.request.url)
 
