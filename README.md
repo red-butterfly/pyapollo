@@ -12,7 +12,7 @@ Installation
 ------------
 
 ``` shell
-pip install apollo-client
+pip install apollo-client-py
 ```
 
 # Features
